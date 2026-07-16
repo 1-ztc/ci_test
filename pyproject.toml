@@ -1,0 +1,47 @@
+[project]
+name = "moss-ci"
+version = "0.1.0"
+description = "AI Agent Evaluation Platform for Moss"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]",
+    "pydantic>=2",
+    "pyyaml",
+    "httpx",
+    "asyncpg",
+    "sqlalchemy[asyncio]",
+    "aiosqlite",      # runtime: CLI run/history/status/diff persist to SQLite
+    "alembic",
+    "redis[hiredis]",
+    "boto3",
+    "rich",
+    "typer",
+    "sse-starlette",
+    "structlog",
+    "tenacity",
+    "networkx",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "pytest-cov",
+    "httpx",          # for TestClient
+]
+
+[project.scripts]
+moss-ci = "moss_ci.cli.main:app"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["moss_ci*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

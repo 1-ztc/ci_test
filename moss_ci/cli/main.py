@@ -1,0 +1,329 @@
+import typer, asyncio, uuid, yaml
+from pathlib import Path
+from rich.console import Console
+from rich.table import Table
+from moss_ci.parser.yaml_parser import parse_suite, parse_suite_string
+from moss_ci.engine.pipeline import PipelineEngine, PipelineConfig
+from moss_ci.engine.diff import DiffEngine
+from moss_ci.models.result import PipelineResult
+from moss_ci.runner.base import MossRunner
+from moss_ci.storage.db import get_db
+from moss_ci.storage.repository import RunRepository
+
+app = typer.Typer(name="moss-ci", help="Moss CI — AI Agent Evaluation Platform")
+console = Console()
+
+
+@app.command()
+def run(
+    path: str = typer.Argument("./suites", help="Suite file or directory"),
+    test_name: str = typer.Option(None, "--test", help="Run a specific test"),
+    tag: str = typer.Option(None, "--tag", help="Run only tests with this tag (e.g. quick / full)"),
+    fail_fast: bool = typer.Option(True, "--fail-fast/--no-fail-fast"),
+    concurrency: int = typer.Option(None, "--concurrency", "-c", help="Global cap on concurrent Moss calls. Omit to use each suite's YAML max_concurrency."),
+    mock: bool = typer.Option(False, "--mock", help="Use mock Moss output (no real Moss invoked)"),
+):
+    """Run test suites."""
+    p = Path(path)
+    if not p.exists():
+        console.print(f"[red]Error:[/red] Path not found: {path}")
+        raise typer.Exit(1)
+
+    suite_files = [p] if p.is_file() else sorted(p.glob("*.yaml")) + sorted(p.glob("*.yml"))
+    if not suite_files:
+        console.print(f"[red]Error:[/red] No YAML files found in {path}")
+        raise typer.Exit(1)
+
+    suites = []
+    for f in suite_files:
+        try:
+            suites.append(parse_suite(str(f)))
+            console.print(f"[green]✓[/green] Loaded: {f.name}")
+        except Exception as e:
+            console.print(f"[red]✗[/red] Failed: {f.name} — {e}")
+
+    if not suites:
+        raise typer.Exit(1)
+
+    # Tag filtering: keep only tests carrying the requested tag. Used by CI
+    # to split a suite into a fast layer (push) and a full layer (nightly).
+    if tag:
+        kept = 0
+        for s in suites:
+            s.tests = [t for t in s.tests if tag in t.tags]
+            kept += len(s.tests)
+        suites = [s for s in suites if s.tests]
+        if not suites:
+            console.print(f"[yellow]No tests matched tag '{tag}'.[/yellow]")
+            raise typer.Exit(1)
+        console.print(f"[dim]Filtered to tag '{tag}': {kept} test(s)[/dim]")
+
+    # mock=False (default) invokes a real MossRunner that auto-detects the
+    # backend from env (MOSS_CLI_COMMAND / MOSS_API_URL / moss SDK).
+    # --mock keeps the scaffold behavior ([mock] Moss: <prompt>) for runs
+    # where no Moss instance is available.
+    runner = None if mock else MossRunner()
+
+    console.print(f"\nRunning {sum(len(s.tests) for s in suites)} tests across {len(suites)} suites...\n")
+
+    async def _run_and_save():
+        engine = PipelineEngine(PipelineConfig(fail_fast=fail_fast, max_concurrency=concurrency), runner=runner)
+        result = await engine.run(suites)
+        # Persist so `history`/`status`/`diff` can read it back. Same event
+        # loop as the run — calling asyncio.run() a second time here would
+        # raise "cannot be called from a running event loop" / leave a stale
+        # loop on some platforms.
+        run_id = result.run_id or uuid.uuid4().hex[:8]
+        result.run_id = run_id
+        try:
+            db = get_db()
+            await db.init()
+            await RunRepository(db).save(result)
+        except Exception as e:
+            # Persistence is best-effort in the CLI; don't let a DB hiccup
+            # mask the actual test results.
+            console.print(f"[yellow]warn: could not persist run ({e})[/yellow]")
+        return result, run_id
+
+    result, run_id = asyncio.run(_run_and_save())
+
+    table = Table(title="Results")
+    table.add_column("Suite", style="cyan")
+    table.add_column("Passed", style="green")
+    table.add_column("Failed", style="red")
+    table.add_column("Error", style="yellow")
+    for s in result.suites:
+        table.add_row(s.suite_name, str(s.passed), str(s.failed), str(s.error))
+    console.print(table)
+    console.print(f"\n[bold]{result.summary}[/bold]")
+    console.print(f"[dim]run_id: {run_id}  (use `moss-ci diff <prev> {run_id}` to compare)[/dim]")
+    if result.status.value == "failed":
+        raise typer.Exit(1)
+
+
+def _render_flake_runs(t, console: Console) -> None:
+    """Show each flake run's verdict under a test.
+
+    Used by ``status`` and ``logs`` so a flake test isn't a bare "flake" with
+    no breakdown of which runs passed/failed and what the judge scored each.
+    """
+    if not t.flake_runs:
+        return
+    passes = sum(1 for r in t.flake_runs if r.status == "pass")
+    console.print(f"      [dim]flake: {passes}/{len(t.flake_runs)} runs passed[/dim]")
+    for i, r in enumerate(t.flake_runs):
+        color = "green" if r.status == "pass" else ("red" if r.status == "fail" else "yellow")
+        extra = ""
+        for ev in r.evals:
+            if ev.type == "llm_judge":
+                if ev.score is not None:
+                    extra = f"  judge={ev.score}"
+                elif ev.skipped and ev.error:
+                    extra = f"  judge skipped ({ev.error})"
+                break
+        console.print(f"      [{color}]{r.status:6}[/] run{i}{extra}")
+
+
+@app.command()
+def status(run_id: str = typer.Argument(..., help="Run ID")):
+    """Show run status."""
+    async def _get():
+        db = get_db()
+        await db.init()
+        return await RunRepository(db).get(run_id)
+    result = asyncio.run(_get())
+    if result is None:
+        console.print(f"[red]Run not found:[/red] {run_id}")
+        raise typer.Exit(1)
+    console.print(f"[bold]{run_id}[/bold]  {result.status.value}  {result.summary}")
+    for s in result.suites:
+        console.print(f"  {s.suite_name}: {s.passed}/{s.total} passed")
+        for t in s.tests:
+            color = "green" if t.status == "pass" else ("red" if t.status == "fail" else "yellow")
+            console.print(f"    [{color}]{t.status:6}[/] {t.test_name}")
+            _render_flake_runs(t, console)
+
+
+@app.command()
+def logs(run_id: str = typer.Argument(..., help="Run ID"), test_name: str = typer.Option(None, "--test")):
+    """Show run logs."""
+    async def _get():
+        db = get_db()
+        await db.init()
+        return await RunRepository(db).get(run_id)
+    result = asyncio.run(_get())
+    if result is None:
+        console.print(f"[red]Run not found:[/red] {run_id}")
+        raise typer.Exit(1)
+    for s in result.suites:
+        for t in s.tests:
+            if test_name and t.test_name != test_name:
+                continue
+            console.print(f"[bold]{t.test_name}[/bold] ({t.status}):")
+            console.print(t.moss_output[:500])
+            _render_flake_runs(t, console)
+
+
+@app.command()
+def history(limit: int = typer.Option(20, "--limit", "-n")):
+    """Show run history."""
+    async def _list():
+        db = get_db()
+        await db.init()
+        return await RunRepository(db).list(limit=limit)
+    runs = asyncio.run(_list())
+    if not runs:
+        console.print("[yellow]No runs yet.[/yellow]")
+        return
+    table = Table(title="Run History")
+    table.add_column("Run ID", style="cyan")
+    table.add_column("Pipeline")
+    table.add_column("Status")
+    table.add_column("Summary")
+    for r in runs:
+        color = "green" if r.status.value == "success" else "red"
+        table.add_row(r.run_id, r.pipeline_name, f"[{color}]{r.status.value}[/]", r.summary)
+    console.print(table)
+
+
+def _print_diff(d, prev_id: str, curr_id: str) -> None:
+    """Print a DiffResult as a human-readable regression report.
+
+    Shared by `diff` (reads runs from DB) and `diff-files` (reads exported
+    JSON), so both produce identical output.
+    """
+    console.print(f"[bold]Regression diff[/bold]: {prev_id} (prev)  vs  {curr_id} (curr)\n")
+    if not (d.new_failures or d.fixed or d.improved or d.degraded):
+        console.print("[green]No changes — same results in both runs.[/green]")
+        return
+    if d.new_failures:
+        console.print(f"[red]⚠ {len(d.new_failures)} new failure(s):[/red]")
+        for it in d.new_failures:
+            console.print(f"    {it.test_name}  {it.previous_status} → {it.current_status}")
+    if d.fixed:
+        console.print(f"[green]✓ {len(d.fixed)} fixed:[/green]")
+        for it in d.fixed:
+            console.print(f"    {it.test_name}  {it.previous_status} → {it.current_status}")
+    if d.improved:
+        console.print(f"[green]↑ {len(d.improved)} improved:[/green]")
+        for it in d.improved:
+            console.print(f"    {it.test_name}  {it.previous_score} → {it.current_score}")
+    if d.degraded:
+        console.print(f"[red]↓ {len(d.degraded)} degraded:[/red]")
+        for it in d.degraded:
+            console.print(f"    {it.test_name}  {it.previous_score} → {it.current_score}")
+
+
+@app.command()
+def diff(run_id_1: str = typer.Argument(..., help="Previous run ID"),
+         run_id_2: str = typer.Argument(..., help="Current run ID")):
+    """Compare two runs (regression analysis). Reads both from the local DB."""
+    async def _get():
+        db = get_db()
+        await db.init()
+        repo = RunRepository(db)
+        return await repo.get(run_id_1), await repo.get(run_id_2)
+    prev, curr = asyncio.run(_get())
+    if prev is None:
+        console.print(f"[red]Previous run not found:[/red] {run_id_1}")
+        raise typer.Exit(1)
+    if curr is None:
+        console.print(f"[red]Current run not found:[/red] {run_id_2}")
+        raise typer.Exit(1)
+    d = DiffEngine().compare(curr, prev)
+    _print_diff(d, run_id_1, run_id_2)
+
+
+@app.command()
+def export(run_id: str = typer.Argument(None, help="Run ID to export (omit for the latest run)"),
+           out: str = typer.Option(..., "--out", "-o", help="Output JSON file path")):
+    """Export a run from the local DB to a JSON file.
+
+    Lets a run result travel outside the SQLite DB — e.g. a CI runner can
+    upload it as an artifact/cache and a later run (or local checkout) can
+    `diff-files` against it. Omit run_id to export the most recent run
+    (handy in CI where the run_id isn't easily captured from `run` output).
+    """
+    async def _get():
+        db = get_db()
+        await db.init()
+        repo = RunRepository(db)
+        if run_id is None:
+            latest = await repo.list(limit=1)
+            if not latest:
+                return None, None
+            return latest[0], latest[0].run_id
+        return await repo.get(run_id), run_id
+    result, resolved_id = asyncio.run(_get())
+    if result is None:
+        console.print(f"[red]Run not found:[/red] {run_id or '(latest)'}")
+        raise typer.Exit(1)
+    Path(out).write_text(result.model_dump_json(indent=2), encoding="utf-8")
+    console.print(f"[green]✓[/green] Exported {resolved_id} → {out}")
+
+
+@app.command()
+def diff_files(prev_file: str = typer.Argument(..., help="Previous run JSON file"),
+               curr_file: str = typer.Argument(..., help="Current run JSON file")):
+    """Compare two runs exported as JSON files (regression analysis).
+
+    Counterpart to `export`: read two PipelineResult JSON files and report
+    new_failures / fixed / improved / degraded. Used by CI to diff against
+    the last run's exported result, and locally to compare exported runs.
+    """
+    try:
+        prev = PipelineResult.model_validate_json(Path(prev_file).read_text(encoding="utf-8"))
+    except Exception as e:
+        console.print(f"[red]Cannot read previous file {prev_file}:[/red] {e}")
+        raise typer.Exit(1)
+    try:
+        curr = PipelineResult.model_validate_json(Path(curr_file).read_text(encoding="utf-8"))
+    except Exception as e:
+        console.print(f"[red]Cannot read current file {curr_file}:[/red] {e}")
+        raise typer.Exit(1)
+    d = DiffEngine().compare(curr, prev)
+    _print_diff(d, prev.run_id or prev_file, curr.run_id or curr_file)
+
+
+@app.command()
+def init():
+    """Initialize a moss-ci project."""
+    config = {"version": "1.0", "suites_dir": "./suites"}
+    p = Path("moss-ci.yaml")
+    if p.exists():
+        console.print("[yellow]moss-ci.yaml already exists[/yellow]")
+        return
+    p.write_text(yaml.dump(config, allow_unicode=True), encoding="utf-8")
+    Path("./suites").mkdir(exist_ok=True)
+    console.print("[green]✓[/green] Created moss-ci.yaml and suites/")
+
+
+@app.command()
+def validate(path: str = typer.Argument("./suites", help="Suite file or directory")):
+    """Validate suite YAML files."""
+    p = Path(path)
+    if not p.exists():
+        console.print(f"[red]Error:[/red] Path not found: {path}")
+        raise typer.Exit(1)
+
+    files = [p] if p.is_file() else sorted(p.glob("*.yaml")) + sorted(p.glob("*.yml"))
+    if not files:
+        console.print(f"[red]Error:[/red] No YAML files found")
+        raise typer.Exit(1)
+
+    errors = 0
+    for f in files:
+        try:
+            parse_suite(str(f))
+            console.print(f"[green]✓[/green] {f.name}")
+        except Exception as e:
+            console.print(f"[red]✗[/red] {f.name}: {e}")
+            errors += 1
+    if errors:
+        console.print(f"\n[red]{errors} file(s) failed validation[/red]")
+        raise typer.Exit(1)
+    console.print(f"\n[green]All {len(files)} file(s) valid[/green]")
+
+
+if __name__ == "__main__":
+    app()
